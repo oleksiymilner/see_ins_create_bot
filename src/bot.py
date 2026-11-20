@@ -1,7 +1,9 @@
 import html
 import logging
 import os
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 from requests.auth import HTTPBasicAuth
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
@@ -20,19 +22,15 @@ CONFLUENCE_BASE_URL = "https://oleksiymilner.atlassian.net/wiki"
 ATLASSIAN_EMAIL = os.getenv("ATLASSIAN_EMAIL", "your-email@example.com")
 ATLASSIAN_API_TOKEN = os.getenv("ATLASSIAN_API_TOKEN", "YOUR_ATLASSIAN_API_TOKEN")
 
-# Confluence IDs extracted from your URLs
 TEMPLATE_IDS = {
     "Sell Apartment contract": "1736705",
     "Rent Apartment contract": "1998849",
 }
 TARGET_FOLDER_ID = "458753"
 
-# Placeholder keys used inside your Confluence templates
-# (Update these if your templates use different placeholder names)
 FIRST_NAME_PLACEHOLDER = "{{FIRST_NAME}}"
 LAST_NAME_PLACEHOLDER = "{{LAST_NAME}}"
 
-# Conversation states
 CHOOSING_CONTRACT, TYPING_LASTNAME, TYPING_FIRSTNAME = range(3)
 
 logging.basicConfig(
@@ -41,13 +39,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# --- HTTP HEALTH CHECK SERVER FOR RENDER & UPTIMEROBOT ---
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+        logger.info("Health ping received: GET %s", self.path)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        logger.info("Health ping received: HEAD %s", self.path)
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server() -> None:
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health check server listening on 0.0.0.0:%s", port)
+
+
 # --- CONFLUENCE API HELPERS ---
 def get_confluence_auth() -> HTTPBasicAuth:
     return HTTPBasicAuth(ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN)
 
 
 def fetch_template_page(page_id: str) -> dict:
-    """Fetch template page storage XHTML and spaceId from Confluence v2 API."""
     url = f"{CONFLUENCE_BASE_URL}/api/v2/pages/{page_id}"
     params = {"body-format": "storage"}
     headers = {"Accept": "application/json"}
@@ -62,7 +86,6 @@ def fetch_template_page(page_id: str) -> dict:
 def create_contract_page(
     space_id: str, parent_folder_id: str, title: str, storage_body: str
 ) -> dict:
-    """Create a new Confluence page inside the target folder."""
     url = f"{CONFLUENCE_BASE_URL}/api/v2/pages"
     headers = {
         "Accept": "application/json",
@@ -132,13 +155,11 @@ async def firstname_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("Generating contract in Confluence...")
 
     try:
-        # 1. Get template
         template_data = fetch_template_page(template_id)
         space_id = template_data["spaceId"]
         template_title = template_data["title"]
         body_html = template_data["body"]["storage"]["value"]
 
-        # 2. Replace placeholders (escape XML/HTML special chars like &, <, >)
         safe_firstname = html.escape(firstname)
         safe_lastname = html.escape(lastname)
 
@@ -146,11 +167,9 @@ async def firstname_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
             LAST_NAME_PLACEHOLDER, safe_lastname
         )
 
-        # 3. Build a unique page title (Confluence requires unique titles per space)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         new_title = f"{template_title} - {lastname} {firstname} ({timestamp})"
 
-        # 4. Create new page in folder 458753
         created_page = create_contract_page(
             space_id=space_id,
             parent_folder_id=TARGET_FOLDER_ID,
@@ -192,6 +211,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 def main() -> None:
+    start_health_server()
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -214,7 +234,7 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
-    application.run_polling()
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
